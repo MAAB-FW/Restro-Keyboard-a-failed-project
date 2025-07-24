@@ -1,17 +1,17 @@
 use eframe::{self, App};
-use egui::{self, FontFamily, RichText, TextStyle, ViewportBuilder};
+use egui::{self, FontFamily, RichText, TextStyle, ViewportBuilder, ViewportCommand};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::{collections::HashMap, fs, sync::Mutex};
 use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_KEYBOARD, INPUT_TYPE, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput,
-    VK_BACK, VK_CONTROL, VK_SPACE,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, HHOOK, KBDLLHOOKSTRUCT, SetWindowsHookExA, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, SetWindowsHookExA, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT,
+    KBDLLHOOKSTRUCT_FLAGS, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -217,7 +217,7 @@ impl KeyboardApp {
 impl App for KeyboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
@@ -226,7 +226,7 @@ impl App for KeyboardApp {
                         self.show_settings = true;
                     }
                     if ui.button("Exit").clicked() {
-                        std::process::exit(0);
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
                     }
                 });
                 ui.menu_button("Help", |ui| {
@@ -274,7 +274,7 @@ impl App for KeyboardApp {
                             .checkbox(&mut settings.enabled, "Enable keyboard")
                             .clicked()
                         {
-                            settings.enabled = !settings.enabled;
+                            // The state is already updated by the checkbox
                         }
 
                         ui.add_space(10.0);
@@ -452,51 +452,31 @@ impl App for KeyboardApp {
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let kbd_struct = unsafe { *(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    let vk_code = kbd_struct.vkCode;
+    let vk_code = VIRTUAL_KEY(kbd_struct.vkCode as u16);
     let flags = kbd_struct.flags;
-
-    println!(
-        "Key event: code={:x}, type={}, flags={:x}",
-        vk_code, wparam.0, flags.0
-    );
 
     if code < 0 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
     // Don't process injected keystrokes (prevents infinite recursion)
-    if (flags & windows::Win32::UI::WindowsAndMessaging::KBDLLHOOKSTRUCT_FLAGS(0x10)).0 != 0 {
+    if (flags & KBDLLHOOKSTRUCT_FLAGS(0x10)).0 != 0 {
         return unsafe { CallNextHookEx(None, code, wparam, lparam) };
     }
 
-    // Print debug info
-    println!(
-        "Key: {:x}, Type: {}, Ctrl: {}",
-        vk_code,
-        wparam.0,
-        CTRL_PRESSED.load(Ordering::SeqCst)
-    );
-
     let msg_type = wparam.0 as u32;
-    println!(
-        "Key event: code={:x}, type={}, injected={}",
-        vk_code,
-        msg_type,
-        (flags.0 & 0x10) != 0
-    );
 
     match msg_type {
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if vk_code == VK_CONTROL.0 as u32 {
+            if vk_code == VK_CONTROL {
                 CTRL_PRESSED.store(true, Ordering::SeqCst);
             }
 
             // Handle backspace
-            if vk_code == VK_BACK.0 as u32 {
+            if vk_code == VK_BACK {
                 let mut buffer = BUFFER.lock().unwrap();
                 if !buffer.is_empty() {
                     buffer.pop();
-                    println!("Backspace pressed, buffer now: {}", buffer);
                 }
                 return unsafe { CallNextHookEx(None, code, wparam, lparam) };
             }
@@ -505,7 +485,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             if settings.enabled {
                 // Handle language switching hotkey (Ctrl+Space)
                 if settings.hotkey_enabled {
-                    if vk_code == VK_SPACE.0 as u32 && CTRL_PRESSED.load(Ordering::SeqCst) {
+                    if vk_code == VK_SPACE && CTRL_PRESSED.load(Ordering::SeqCst) {
                         drop(settings); // Release lock before modifying
                         let mut settings = SETTINGS.lock().unwrap();
                         let new_lang = if settings.current_language == "Bangla" {
@@ -520,18 +500,18 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 
                 // Process key input if in Bangla mode
                 if settings.current_language == "Bangla" && settings.intercept_all {
-                    let key = if vk_code >= 0x41 && vk_code <= 0x5A {
+                    let key_code = vk_code.0 as u32;
+                    let key = if (0x41..=0x5A).contains(&key_code) {
                         // Convert A-Z to lowercase a-z
-                        Some(((vk_code - 0x41 + 0x61) as u8 as char).to_string())
-                    } else if vk_code >= 0x30 && vk_code <= 0x39 {
+                        Some(((key_code - 0x41 + 0x61) as u8 as char).to_string())
+                    } else if (0x30..=0x39).contains(&key_code) {
                         // Numbers 0-9
-                        Some(((vk_code - 0x30) as u8 as char).to_string())
+                        Some(((key_code - 0x30) as u8 as char).to_string())
                     } else {
                         None
                     };
 
                     if let Some(key) = key {
-                        println!("Detected key: {}", key);
                         let mut buffer = BUFFER.lock().unwrap();
 
                         // If this is a vowel and the buffer is empty, handle it directly
@@ -548,10 +528,6 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         if let Some((output, backspaces)) =
                             process_keyboard_input(&key, &mut buffer)
                         {
-                            println!(
-                                "Processing result: output='{}', backspaces={}",
-                                output, backspaces
-                            );
                             drop(buffer); // Release lock before simulating input
 
                             // First remove the typed English text
@@ -572,7 +548,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             }
         }
         WM_KEYUP | WM_SYSKEYUP => {
-            if vk_code == VK_CONTROL.0 as u32 {
+            if vk_code == VK_CONTROL {
                 CTRL_PRESSED.store(false, Ordering::SeqCst);
             }
         }
@@ -583,22 +559,21 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up keyboard hook first
-    unsafe {
-        *KEYBOARD_HOOK.lock().unwrap() = Some(SetWindowsHookExA(
+    let hook = unsafe {
+        SetWindowsHookExA(
             WH_KEYBOARD_LL,
             Some(keyboard_hook_proc),
-            HMODULE(0),
+            HMODULE::default(),
             0,
-        )?);
-    }
+        )?
+    };
+    *KEYBOARD_HOOK.lock().unwrap() = Some(hook);
 
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_min_inner_size([400.0, 300.0])
             .with_title("Restro Keyboard"),
-        follow_system_theme: true,
-        default_theme: eframe::Theme::Light,
         ..Default::default()
     };
 
@@ -624,30 +599,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load font data
     let font_data = fs::read(&bengali_font_path)?;
-
-    // Initialize window for hook context
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExA, HWND_MESSAGE, WS_OVERLAPPED,
-        };
-        let window = CreateWindowExA(
-            Default::default(),
-            windows::s!("STATIC"),
-            windows::s!("Restro Keyboard Hook"),
-            WS_OVERLAPPED,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            None,
-            None,
-            None,
-        );
-        if window.0 == 0 {
-            return Err("Failed to create message-only window".into());
-        }
-    };
 
     // Run UI in the main thread
     eframe::run_native(
@@ -676,7 +627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Clean up hook on exit
     unsafe {
         if let Some(hook) = KEYBOARD_HOOK.lock().unwrap().take() {
-            UnhookWindowsHookEx(hook);
+            let _ = UnhookWindowsHookEx(hook);
         }
     }
 
@@ -686,8 +637,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn process_keyboard_input(key: &str, buffer: &mut String) -> Option<(String, usize)> {
     buffer.push_str(key);
     let buffer_str = buffer.as_str();
-
-    println!("Processing input - Buffer: {}, Key: {}", buffer_str, key);
 
     // Special case: if the buffer gets too long, clear it
     if buffer_str.len() > 5 {
@@ -723,8 +672,6 @@ fn process_keyboard_input(key: &str, buffer: &mut String) -> Option<(String, usi
 
             // Try exact match for the current substring
             if let Some(bangla_char) = PHONETIC_MAP.get(substr) {
-                println!("Found match for: {}", substr);
-
                 let prev_was_consonant = if len < buffer_str.len() {
                     buffer_str
                         .chars()
@@ -782,9 +729,9 @@ fn process_keyboard_input(key: &str, buffer: &mut String) -> Option<(String, usi
 
 fn simulate_backspace() {
     unsafe {
-        let input1 = INPUT {
-            r#type: INPUT_TYPE(INPUT_KEYBOARD.0),
-            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+        let mut input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: VK_BACK,
                     wScan: 0,
@@ -794,22 +741,16 @@ fn simulate_backspace() {
                 },
             },
         };
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
-        let input2 = INPUT {
-            r#type: INPUT_TYPE(INPUT_KEYBOARD.0),
-            Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: VK_BACK,
-                    wScan: 0,
-                    dwFlags: KEYEVENTF_KEYUP,
-                    time: 0,
-                    dwExtraInfo: 0,
-                },
-            },
+        input.Anonymous.ki = KEYBDINPUT {
+            wVk: VK_BACK,
+            wScan: 0,
+            dwFlags: KEYEVENTF_KEYUP,
+            time: 0,
+            dwExtraInfo: 0,
         };
-
-        let inputs = [input1, input2];
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
     }
 }
 
@@ -819,11 +760,11 @@ fn simulate_unicode_input(text: &str) {
 
     for c in text.chars() {
         unsafe {
-            let input1 = INPUT {
-                r#type: INPUT_TYPE(INPUT_KEYBOARD.0),
-                Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+            let mut input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
                     ki: KEYBDINPUT {
-                        wVk: Default::default(),
+                        wVk: VIRTUAL_KEY(0),
                         wScan: c as u16,
                         dwFlags: KEYEVENTF_UNICODE,
                         time: 0,
@@ -831,22 +772,16 @@ fn simulate_unicode_input(text: &str) {
                     },
                 },
             };
+            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
-            let input2 = INPUT {
-                r#type: INPUT_TYPE(INPUT_KEYBOARD.0),
-                Anonymous: windows::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: Default::default(),
-                        wScan: c as u16,
-                        dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                        time: 0,
-                        dwExtraInfo: 0,
-                    },
-                },
+            input.Anonymous.ki = KEYBDINPUT {
+                wVk: VIRTUAL_KEY(0),
+                wScan: c as u16,
+                dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                time: 0,
+                dwExtraInfo: 0,
             };
-
-            let inputs = [input1, input2];
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
             // Small delay to ensure characters are typed in the correct order
             std::thread::sleep(delay);
